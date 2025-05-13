@@ -9,35 +9,39 @@ import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class ObjectDetector(
     private val context: Context,
-    private val modelName: String = "ssd_mobilenet_v1.tflite",
-    private val labelsName: String = "labels.txt"
+    /** 모델 파일 이름 (예: "efficientdet_lite1_384_ptq.tflite") */
+    val modelName: String,
+    /** 라벨 파일 이름 ("coco_labels.txt") */
+    private val labelsName: String = "coco_labels.txt"
 ) {
-    private var interpreter: Interpreter? = null
-    private var labels: List<String> = emptyList()
-    private val imageSizeX: Int = 300
-    private val imageSizeY: Int = 300
-    private val inputSize: Int = 300
-    private val numDetections = 10 // 모델에 따라 달라질 수 있음
-
-    private val imageProcessor = ImageProcessor.Builder()
-        .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
-        .build()
+    private val interpreter: Interpreter
+    private val imageProcessor: ImageProcessor
+    private val labels: List<String>
 
     init {
-        try {
-            val options = Interpreter.Options()
-            options.setNumThreads(4)
-            interpreter = Interpreter(FileUtil.loadMappedFile(context, modelName), options)
-            labels = FileUtil.loadLabels(context, labelsName)
-            Log.d(TAG, "TFLite model loaded successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading TFLite model: ${e.message}")
-        }
+        // 1) Interpreter 로드
+        val options = Interpreter.Options().setNumThreads(4)
+        interpreter = Interpreter(
+            FileUtil.loadMappedFile(context, modelName),
+            options
+        )
+
+        // 2) 입력 텐서 shape 조회 ([1, H, W, C])
+        val inShape = interpreter.getInputTensor(0).shape()
+        val inputH = inShape[1]
+        val inputW = inShape[2]
+        Log.d(TAG, "[$modelName] input tensor shape = ${inShape.joinToString()}")
+
+        // 3) 동적 입력 크기에 맞춘 ImageProcessor
+        imageProcessor = ImageProcessor.Builder()
+            .add(ResizeOp(inputH, inputW, ResizeOp.ResizeMethod.BILINEAR))
+            .build()
+
+        // 4) 라벨 로드
+        labels = FileUtil.loadLabels(context, labelsName)
     }
 
     data class DetectionResult(
@@ -48,66 +52,75 @@ class ObjectDetector(
     )
 
     fun detect(bitmap: Bitmap): List<DetectionResult> {
-        if (interpreter == null) {
-            Log.e(TAG, "Interpreter is null")
-            return emptyList()
-        }
-
-        // 입력 이미지 준비
-        val tensorImage = TensorImage.fromBitmap(bitmap)
+        // A) 입력 준비
+        val tensorImage    = TensorImage.fromBitmap(bitmap)
         val processedImage = imageProcessor.process(tensorImage)
+        val inputBuffer    = processedImage.buffer
 
-        // 출력 버퍼 준비
-        val outputLocations = Array(1) { Array(numDetections) { FloatArray(4) } } // [1][10][4]
-        val outputClasses = Array(1) { FloatArray(numDetections) } // [1][10]
-        val outputScores = Array(1) { FloatArray(numDetections) } // [1][10]
-        val numDetectionOutput = FloatArray(1) // [1]
+        // B) 출력 버퍼를 동적으로 생성
+        val outputs = mutableMapOf<Int, Any>()
+        var boxesRaw: Array<Array<FloatArray>>? = null
+        var classesRaw: Array<FloatArray>?     = null
+        var scoresRaw: Array<FloatArray>?      = null
+        var countRaw: FloatArray?              = null
+        var boxesAssigned = false
 
-        val outputs = mapOf(
-            0 to outputLocations,
-            1 to outputClasses,
-            2 to outputScores,
-            3 to numDetectionOutput
-        )
-
-        // 추론 실행
-        interpreter?.runForMultipleInputsOutputs(arrayOf(processedImage.buffer), outputs)
-
-        // 결과 파싱
-        val detectionResults = mutableListOf<DetectionResult>()
-        val numDetectionsOutput = numDetectionOutput[0].toInt()
-
-        for (i in 0 until numDetectionsOutput) {
-            val confidence = outputScores[0][i]
-            if (confidence >= 0.5f) { // 신뢰도 임계값 (0.5)
-                val detectionClass = outputClasses[0][i].toInt()
-                val label = if (detectionClass < labels.size) labels[detectionClass] else "Unknown"
-
-                val location = outputLocations[0][i]
-                val boundingBox = RectF(
-                    location[1] * bitmap.width,
-                    location[0] * bitmap.height,
-                    location[3] * bitmap.width,
-                    location[2] * bitmap.height
-                )
-
-                detectionResults.add(
-                    DetectionResult(
-                        id = detectionClass,
-                        label = label,
-                        confidence = confidence,
-                        boundingBox = boundingBox
-                    )
-                )
+        for (i in 0 until interpreter.outputTensorCount) {
+            val shape = interpreter.getOutputTensor(i).shape()
+            when {
+                // [1, N, 4] → 바운딩 박스
+                shape.size == 3 && shape[2] == 4 && !boxesAssigned -> {
+                    val raw = Array(shape[0]) { Array(shape[1]) { FloatArray(shape[2]) } }
+                    outputs[i] = raw
+                    boxesRaw = raw
+                    boxesAssigned = true
+                }
+                // [1, N] → 클래스 or 스코어
+                shape.size == 2 -> {
+                    val raw = Array(shape[0]) { FloatArray(shape[1]) }
+                    outputs[i] = raw
+                    if (classesRaw == null) classesRaw = raw else scoresRaw = raw
+                }
+                // [1] → 검출 개수
+                shape.size == 1 -> {
+                    val raw = FloatArray(shape[0])
+                    outputs[i] = raw
+                    countRaw = raw
+                }
+                else -> {
+                    // 기타 텐서는 무시
+                }
             }
         }
 
-        return detectionResults
+        // C) 추론 실행
+        interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
+
+        // D) 결과 파싱
+        val detectedCount = countRaw?.get(0)?.toInt() ?: boxesRaw?.get(0)?.size ?: 0
+        val results = mutableListOf<DetectionResult>()
+        for (i in 0 until detectedCount) {
+            val conf = scoresRaw?.get(0)?.get(i) ?: continue
+            if (conf < 0.5f) continue
+
+            val clsIdx = classesRaw?.get(0)?.get(i)?.toInt() ?: continue
+            val label  = labels.getOrElse(clsIdx) { "Unknown" }
+
+            val coords = boxesRaw?.get(0)?.get(i) ?: continue
+            val box = RectF(
+                coords[1] * bitmap.width,
+                coords[0] * bitmap.height,
+                coords[3] * bitmap.width,
+                coords[2] * bitmap.height
+            )
+            results.add(DetectionResult(clsIdx, label, conf, box))
+        }
+
+        return results
     }
 
     fun close() {
-        interpreter?.close()
-        interpreter = null
+        interpreter.close()
     }
 
     companion object {

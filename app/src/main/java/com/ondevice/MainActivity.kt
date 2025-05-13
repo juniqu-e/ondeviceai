@@ -8,8 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import com.ondevice.ai.PosterScreen
 import com.ondevice.ai.PosterViewModel
-import com.ondevice.ui.PosterScreen
 import com.ondevice.ui.theme.OnDeviceTheme
 
 class MainActivity : ComponentActivity() {
